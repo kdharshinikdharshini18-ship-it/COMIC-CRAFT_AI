@@ -1,0 +1,705 @@
+================================================================================
+FILE: app/__init__.py
+================================================================================
+"""ComicCraft application package."""
+
+================================================================================
+FILE: app/config.py
+================================================================================
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+class Settings(BaseSettings):
+    GEMINI_API_KEY: str = ""
+    HF_API_KEY: str = ""
+    GEMINI_FLASH_MODEL: str = "gemini-2.5-flash"
+    GEMINI_PRO_MODEL: str = "gemini-2.5-pro"
+    HF_IMAGE_MODEL: str = "stabilityai/stable-diffusion-3.5-large-turbo"
+    IMAGE_BACKEND: str = "hf"
+    PANEL_COUNT: int = 5
+    MAX_PANELS: int = 8
+    IMAGE_WIDTH: int = 768
+    IMAGE_HEIGHT: int = 768
+    APP_NAME: str = "ComicCraft"
+    DEBUG: bool = True
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    @property
+    def static_dir(self) -> Path:
+        return BASE_DIR / "static"
+
+    @property
+    def panels_dir(self) -> Path:
+        return self.static_dir / "panels"
+
+    @property
+    def exports_dir(self) -> Path:
+        return self.static_dir / "exports"
+
+settings = Settings()
+settings.panels_dir.mkdir(parents=True, exist_ok=True)
+settings.exports_dir.mkdir(parents=True, exist_ok=True)
+
+================================================================================
+FILE: app/models.py
+================================================================================
+from typing import List
+from pydantic import BaseModel, Field, field_validator
+
+class ComicRequest(BaseModel):
+    story_prompt: str = Field(..., min_length=10, max_length=2000)
+    character_name: str = Field(..., min_length=1, max_length=100)
+    setting: str = Field(..., min_length=1, max_length=200)
+    tone: str = Field(default="adventurous", max_length=100)
+    art_style: str = Field(default="comic book", max_length=100)
+    panel_count: int = Field(default=5, ge=1, le=8)
+
+    @field_validator("story_prompt", "character_name", "setting")
+    @classmethod
+    def strip_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("This field cannot be empty.")
+        return value
+
+class PanelOutline(BaseModel):
+    panel_number: int
+    title: str
+    scene_description: str
+    image_prompt: str
+
+class ComicPanel(BaseModel):
+    panel_number: int
+    title: str
+    scene_description: str
+    image_prompt: str
+    caption: str
+    narration: str
+    dialogue: str
+    image_url: str
+
+class ComicResult(BaseModel):
+    title: str
+    panels: List[ComicPanel]
+    pdf_url: str
+
+================================================================================
+FILE: app/main.py
+================================================================================
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from app.config import settings
+from app.routes import router
+
+app = FastAPI(title=settings.APP_NAME, version="1.0.0", description="AI Comic Story Creator using Gemini and image generation.")
+app.mount("/static", StaticFiles(directory=str(settings.static_dir)), name="static")
+app.include_router(router)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "app": settings.APP_NAME}
+
+================================================================================
+FILE: app/routes.py
+================================================================================
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from app.config import settings
+from app.models import ComicRequest
+from app.services.gemini_flash import generate_panel_outline
+from app.services.gemini_pro import generate_story_content
+from app.services.image_generator import generate_panel_image
+from app.services.layout_builder import build_comic_layout
+from app.services.exporters import create_comic_pdf
+
+router = APIRouter()
+templates = Jinja2Templates(directory=str(settings.static_dir.parent / "templates"))
+
+def _generate_comic(data: ComicRequest):
+    outline = generate_panel_outline(data)
+    story = generate_story_content(data, outline.panels)
+    image_urls = [generate_panel_image(p.image_prompt, p.panel_number, data.character_name, data.art_style) for p in outline.panels]
+    layout = build_comic_layout(data, outline.panels, story, image_urls)
+    pdf_url = create_comic_pdf(outline.title, layout)
+    return outline.title, layout, pdf_url
+
+@router.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse(request=request, name="index.html", context={"settings": settings, "error": None})
+
+@router.post("/generate", response_class=HTMLResponse)
+async def generate(
+    request: Request,
+    story_prompt: str = Form(...),
+    character_name: str = Form(...),
+    setting: str = Form(...),
+    tone: str = Form("adventurous"),
+    art_style: str = Form("comic book"),
+    panel_count: int = Form(5),
+):
+    try:
+        data = ComicRequest(story_prompt=story_prompt, character_name=character_name, setting=setting, tone=tone, art_style=art_style, panel_count=panel_count)
+        title, layout, pdf_url = _generate_comic(data)
+        return templates.TemplateResponse(request=request, name="comic_preview.html", context={"title": title, "layout": layout, "pdf_url": pdf_url})
+    except Exception as exc:
+        return templates.TemplateResponse(request=request, name="index.html", context={"settings": settings, "error": str(exc), "form": {"story_prompt": story_prompt, "character_name": character_name, "setting": setting, "tone": tone, "art_style": art_style, "panel_count": panel_count}}, status_code=500)
+
+@router.post("/generate-comic/json")
+async def generate_json(data: ComicRequest):
+    try:
+        title, layout, pdf_url = _generate_comic(data)
+        return JSONResponse({"title": title, "panels": [p.model_dump() for p in layout], "pdf_url": pdf_url})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+@router.get("/export-success", response_class=HTMLResponse)
+async def export_success(request: Request, pdf_url: str = ""):
+    return templates.TemplateResponse(request=request, name="export_success.html", context={"pdf_url": pdf_url})
+
+@router.post("/test-image")
+async def test_image(prompt: str = Form(...)):
+    try:
+        image_url = generate_panel_image(prompt, 0, "Test Character", "comic book")
+        return {"image_url": image_url}
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+================================================================================
+FILE: app/services/__init__.py
+================================================================================
+"""ComicCraft service modules."""
+
+================================================================================
+FILE: app/services/gemini_flash.py
+================================================================================
+from typing import List
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from app.config import settings
+from app.models import ComicRequest, PanelOutline
+
+class OutlineResponse(BaseModel):
+    title: str
+    panels: List[PanelOutline]
+
+def _get_client() -> genai.Client:
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to your .env file.")
+    return genai.Client(api_key=settings.GEMINI_API_KEY)
+
+def generate_panel_outline(request: ComicRequest) -> OutlineResponse:
+    client = _get_client()
+    prompt = f"""
+You are an expert comic-book story planner.
+
+Create a complete comic story outline.
+
+Story idea:
+{request.story_prompt}
+
+Main character:
+{request.character_name}
+
+Setting:
+{request.setting}
+
+Tone:
+{request.tone}
+
+Art style:
+{request.art_style}
+
+Number of panels:
+{request.panel_count}
+
+Requirements:
+1. Create exactly {request.panel_count} panels.
+2. Give the comic a short interesting title.
+3. Every panel must move the story forward.
+4. Maintain character and location continuity.
+5. Each panel needs panel_number, title, scene_description, and image_prompt.
+6. Image prompts must describe the visual scene clearly.
+7. Do not put speech bubbles, captions, logos, or watermarks inside image prompts.
+8. Keep the main character visually consistent throughout the comic.
+9. Make the story suitable for a general audience.
+"""
+    response = client.models.generate_content(
+        model=settings.GEMINI_FLASH_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.8,
+            response_mime_type="application/json",
+            response_schema=OutlineResponse,
+        ),
+    )
+    if not response.parsed:
+        raise RuntimeError("Gemini Flash did not return a valid comic outline.")
+    result: OutlineResponse = response.parsed
+    if len(result.panels) != request.panel_count:
+        raise RuntimeError(f"Expected {request.panel_count} panels, but Gemini returned {len(result.panels)}.")
+    result.panels.sort(key=lambda panel: panel.panel_number)
+    return result
+
+================================================================================
+FILE: app/services/gemini_pro.py
+================================================================================
+from typing import List
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from app.config import settings
+from app.models import ComicRequest, PanelOutline
+
+class StoryPanel(BaseModel):
+    panel_number: int
+    caption: str
+    narration: str
+    dialogue: str
+
+class StoryResponse(BaseModel):
+    panels: List[StoryPanel]
+
+def _get_client() -> genai.Client:
+    if not settings.GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to your .env file.")
+    return genai.Client(api_key=settings.GEMINI_API_KEY)
+
+def generate_story_content(request: ComicRequest, outline: List[PanelOutline]) -> StoryResponse:
+    client = _get_client()
+    outline_text = "\n\n".join(
+        f"Panel {p.panel_number}\nTitle: {p.title}\nScene: {p.scene_description}" for p in outline
+    )
+    prompt = f"""
+You are an expert comic-book writer.
+
+Create the written content for this comic.
+
+Original story:
+{request.story_prompt}
+
+Main character:
+{request.character_name}
+
+Setting:
+{request.setting}
+
+Tone:
+{request.tone}
+
+Comic outline:
+{outline_text}
+
+Requirements:
+1. Return exactly one story object for every panel.
+2. Keep the story continuous.
+3. Write a short caption for each panel.
+4. Write narration when useful.
+5. Write natural dialogue when appropriate.
+6. Keep dialogue concise enough for a comic panel.
+7. Keep the main character consistent.
+8. Do not use markdown.
+9. Do not include image instructions.
+"""
+    response = client.models.generate_content(
+        model=settings.GEMINI_PRO_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.8,
+            response_mime_type="application/json",
+            response_schema=StoryResponse,
+        ),
+    )
+    if not response.parsed:
+        raise RuntimeError("Gemini Pro did not return valid story content.")
+    result: StoryResponse = response.parsed
+    result.panels.sort(key=lambda panel: panel.panel_number)
+    if len(result.panels) != len(outline):
+        raise RuntimeError("The number of story panels does not match the outline.")
+    return result
+
+================================================================================
+FILE: app/services/image_generator.py
+================================================================================
+from pathlib import Path
+from uuid import uuid4
+from PIL import Image
+from app.config import settings
+
+def _safe_filename(panel_number: int) -> str:
+    return f"panel_{panel_number}_{uuid4().hex[:8]}.png"
+
+def _generate_with_huggingface(prompt: str, output_path: Path) -> None:
+    if not settings.HF_API_KEY:
+        raise RuntimeError("HF_API_KEY is missing. Add it to your .env file.")
+    from huggingface_hub import InferenceClient
+    client = InferenceClient(provider="auto", api_key=settings.HF_API_KEY)
+    image = client.text_to_image(prompt=prompt, model=settings.HF_IMAGE_MODEL)
+    if not isinstance(image, Image.Image):
+        raise RuntimeError("Hugging Face did not return a valid image.")
+    image.save(output_path, format="PNG")
+
+def _generate_with_local_diffusers(prompt: str, output_path: Path) -> None:
+    import torch
+    from diffusers import StableDiffusionPipeline
+    model_id = "runwayml/stable-diffusion-v1-5"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    pipe = pipe.to(device)
+    image = pipe(prompt, width=settings.IMAGE_WIDTH, height=settings.IMAGE_HEIGHT, num_inference_steps=30, guidance_scale=7.5).images[0]
+    image.save(output_path, format="PNG")
+
+def generate_panel_image(image_prompt: str, panel_number: int, character_name: str, art_style: str) -> str:
+    filename = _safe_filename(panel_number)
+    output_path = settings.panels_dir / filename
+    final_prompt = f"""
+{image_prompt}
+
+Art style: {art_style}
+Main character: {character_name}
+
+Create a polished comic-book illustration.
+Keep the character appearance consistent. Use clear composition and strong visual storytelling.
+No written text, speech bubbles, captions, logos, or watermark.
+"""
+    backend = settings.IMAGE_BACKEND.lower().strip()
+    if backend == "hf":
+        _generate_with_huggingface(final_prompt, output_path)
+    elif backend in {"local", "diffusers"}:
+        _generate_with_local_diffusers(final_prompt, output_path)
+    else:
+        raise RuntimeError(f"Unsupported IMAGE_BACKEND: {backend}")
+    return f"/static/panels/{filename}"
+
+================================================================================
+FILE: app/services/layout_builder.py
+================================================================================
+from typing import List
+from app.models import ComicPanel, PanelOutline, ComicRequest
+from app.services.gemini_pro import StoryResponse
+
+def build_comic_layout(request: ComicRequest, outline: List[PanelOutline], story: StoryResponse, image_urls: List[str]) -> List[ComicPanel]:
+    if len(outline) != len(story.panels):
+        raise ValueError("Outline and story panel counts do not match.")
+    if len(outline) != len(image_urls):
+        raise ValueError("Outline and image counts do not match.")
+    story_by_number = {panel.panel_number: panel for panel in story.panels}
+    comic_panels = []
+    for index, outline_panel in enumerate(outline):
+        story_panel = story_by_number.get(outline_panel.panel_number)
+        if story_panel is None:
+            raise ValueError(f"Missing story content for panel {outline_panel.panel_number}.")
+        comic_panels.append(ComicPanel(
+            panel_number=outline_panel.panel_number,
+            title=outline_panel.title,
+            scene_description=outline_panel.scene_description,
+            image_prompt=outline_panel.image_prompt,
+            caption=story_panel.caption,
+            narration=story_panel.narration,
+            dialogue=story_panel.dialogue,
+            image_url=image_urls[index],
+        ))
+    return comic_panels
+
+================================================================================
+FILE: app/services/exporters.py
+================================================================================
+from pathlib import Path
+from uuid import uuid4
+from fpdf import FPDF
+from app.config import settings
+from app.models import ComicPanel
+
+def _image_path_from_url(image_url: str) -> Path:
+    prefix = "/static/"
+    if not image_url.startswith(prefix):
+        raise ValueError(f"Invalid static URL: {image_url}")
+    relative_path = image_url[len(prefix):]
+    path = (settings.static_dir / relative_path).resolve()
+    static_root = settings.static_dir.resolve()
+    if path != static_root and static_root not in path.parents:
+        raise ValueError("Invalid file path.")
+    return path
+
+def create_comic_pdf(title: str, panels: list[ComicPanel]) -> str:
+    filename = f"comic_{uuid4().hex[:10]}.pdf"
+    output_path = settings.exports_dir / filename
+    pdf = FPDF(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    for panel in panels:
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.multi_cell(0, 10, title, align="C")
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.multi_cell(0, 8, f"Panel {panel.panel_number}: {panel.title}")
+        image_path = _image_path_from_url(panel.image_url)
+        if image_path.exists():
+            pdf.ln(2)
+            pdf.image(str(image_path), x=15, y=None, w=180)
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "", 11)
+        for label, value in [("Scene", panel.scene_description), ("Caption", panel.caption), ("Narration", panel.narration), ("Dialogue", panel.dialogue)]:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.write(6, f"{label}: ")
+            pdf.set_font("Helvetica", "", 11)
+            pdf.multi_cell(0, 6, value or "")
+            pdf.ln(1)
+    pdf.output(str(output_path))
+    return f"/static/exports/{filename}"
+
+================================================================================
+FILE: templates/index.html
+================================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ComicCraft - AI Comic Story Creator</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}">
+</head>
+<body>
+<header class="hero">
+    <div class="hero-inner">
+        <p class="eyebrow">AI STORY STUDIO</p>
+        <h1>ComicCraft</h1>
+        <p>Turn your imagination into a complete illustrated comic.</p>
+    </div>
+</header>
+<main class="container">
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+    <section class="card">
+        <h2>Create Your Comic</h2>
+        <p class="muted">Enter your idea, choose the style, and let AI build the panels.</p>
+        <form action="/generate" method="post" id="comicForm">
+            <label for="story_prompt">Story Prompt</label>
+            <textarea id="story_prompt" name="story_prompt" rows="5" required placeholder="Example: A brave fox discovers a hidden library in an enchanted forest.">{{ form.story_prompt if form else '' }}</textarea>
+            <div class="grid">
+                <div><label for="character_name">Main Character</label><input id="character_name" name="character_name" required value="{{ form.character_name if form else '' }}" placeholder="Milo"></div>
+                <div><label for="setting">Setting</label><input id="setting" name="setting" required value="{{ form.setting if form else '' }}" placeholder="Enchanted forest"></div>
+                <div><label for="tone">Story Tone</label><select id="tone" name="tone"><option>adventurous</option><option>funny</option><option>dramatic</option><option>light-hearted</option><option>poetic</option></select></div>
+                <div><label for="art_style">Art Style</label><select id="art_style" name="art_style"><option>comic book</option><option>anime</option><option>pixel art</option><option>realistic</option><option>watercolor</option></select></div>
+                <div><label for="panel_count">Number of Panels</label><select id="panel_count" name="panel_count"><option value="3">3</option><option value="4">4</option><option value="5" selected>5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select></div>
+            </div>
+            <button type="submit" id="generateButton">Generate My Comic</button>
+        </form>
+    </section>
+</main>
+<script src="{{ url_for('static', path='js/app.js') }}"></script>
+</body>
+</html>
+
+================================================================================
+FILE: templates/comic_preview.html
+================================================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }} - ComicCraft</title><link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}">
+</head>
+<body>
+<header class="hero compact"><div class="hero-inner"><p class="eyebrow">YOUR GENERATED COMIC</p><h1>{{ title }}</h1><p>Review your story panel by panel.</p></div></header>
+<main class="container">
+    {% for panel in layout %}
+    <article class="panel card">
+        <div class="panel-heading"><span>Panel {{ panel.panel_number }}</span><h2>{{ panel.title }}</h2></div>
+        <img class="comic-image" src="{{ panel.image_url }}" alt="Comic panel {{ panel.panel_number }}">
+        <p class="scene"><strong>Scene:</strong> {{ panel.scene_description }}</p>
+        <div class="story-text">
+            <p><strong>Caption:</strong> {{ panel.caption }}</p>
+            <p><strong>Narration:</strong> {{ panel.narration }}</p>
+            {% if panel.dialogue %}<p><strong>Dialogue:</strong> {{ panel.dialogue }}</p>{% endif %}
+        </div>
+        <details><summary>Image prompt reference</summary><p>{{ panel.image_prompt }}</p></details>
+    </article>
+    {% endfor %}
+    <section class="actions card">
+        <a class="button" href="{{ pdf_url }}" download>Download Your Comic as PDF</a>
+        <a class="button secondary" href="/export-success?pdf_url={{ pdf_url|urlencode }}">Export Success Page</a>
+        <a class="text-link" href="/">Create Another Comic</a>
+    </section>
+</main>
+</body>
+</html>
+
+================================================================================
+FILE: templates/export_success.html
+================================================================================
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Export Complete - ComicCraft</title><link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}"></head>
+<body><main class="success container"><section class="card"><div class="success-icon">✓</div><h1>Comic Export Complete!</h1><p>Your AI-powered comic has been successfully created.</p>{% if pdf_url %}<a class="button" href="{{ pdf_url }}" download>Download PDF</a>{% endif %}<a class="button secondary" href="/">Go Create Another Comic</a></section></main></body></html>
+
+================================================================================
+FILE: static/css/style.css
+================================================================================
+:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#172033;background:#f5f7fb;line-height:1.6}*{box-sizing:border-box}body{margin:0}.hero{padding:70px 20px;background:linear-gradient(135deg,#172033,#5940a8);color:white;text-align:center}.hero.compact{padding:45px 20px}.hero-inner{max-width:900px;margin:auto}.eyebrow{letter-spacing:3px;font-size:.78rem;font-weight:800;opacity:.8}.hero h1{font-size:clamp(2.5rem,7vw,5rem);margin:0}.hero p:last-child{font-size:1.1rem}.container{width:min(1050px,92%);margin:35px auto}.card{background:white;border-radius:22px;padding:28px;box-shadow:0 12px 35px rgba(20,30,60,.08);margin-bottom:25px}.card h2{margin-top:0}.muted{color:#667085}.alert{background:#fff0f0;color:#a11;padding:15px 18px;border-radius:12px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin:20px 0}label{display:block;font-weight:700;margin:0 0 7px}input,textarea,select{width:100%;padding:13px 14px;border:1px solid #d7dce5;border-radius:12px;font:inherit;background:#fff}textarea{resize:vertical}button,.button{display:inline-block;border:0;border-radius:12px;padding:14px 20px;background:#5940a8;color:#fff;text-decoration:none;font-weight:800;cursor:pointer}button{width:100%;font-size:1rem}.button.secondary{background:#edf0f6;color:#172033}.text-link{display:inline-block;margin:14px;color:#5940a8}.panel-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.panel-heading span{background:#eee8ff;color:#5940a8;padding:5px 10px;border-radius:999px;font-weight:800;font-size:.85rem}.panel-heading h2{margin:0}.comic-image{display:block;width:100%;max-width:760px;margin:20px auto;border-radius:16px}.scene{font-style:italic;color:#596273}.story-text{border-left:4px solid #5940a8;padding-left:15px}.story-text p{margin:8px 0}details{margin-top:15px;color:#596273}.actions{text-align:center}.actions .button{margin:6px}.success{min-height:100vh;display:grid;place-items:center;text-align:center}.success-icon{font-size:4rem}.success .button{margin:7px}@media(max-width:700px){.grid{grid-template-columns:1fr}.card{padding:20px}.hero{padding:50px 15px}}
+
+================================================================================
+FILE: static/js/app.js
+================================================================================
+document.addEventListener("DOMContentLoaded", () => {
+  const form = document.getElementById("comicForm");
+  const button = document.getElementById("generateButton");
+  if (!form || !button) return;
+  form.addEventListener("submit", () => {
+    button.disabled = true;
+    button.textContent = "Generating your comic... Please wait";
+  });
+});
+
+================================================================================
+FILE: tests/test_core.py
+================================================================================
+from app.models import ComicRequest, PanelOutline
+from app.services.gemini_pro import StoryPanel, StoryResponse
+from app.services.layout_builder import build_comic_layout
+
+def test_request_validation():
+    request = ComicRequest(story_prompt="A fox finds a secret door in a forest.", character_name="Milo", setting="Forest", panel_count=5)
+    assert request.panel_count == 5
+
+def test_layout_builder():
+    request = ComicRequest(story_prompt="A fox finds a secret door in a forest.", character_name="Milo", setting="Forest", panel_count=1)
+    outline = [PanelOutline(panel_number=1, title="The Door", scene_description="Milo sees a hidden door.", image_prompt="A fox looking at a hidden door")]
+    story = StoryResponse(panels=[StoryPanel(panel_number=1, caption="A strange discovery.", narration="Milo steps closer.", dialogue="What is this?")])
+    layout = build_comic_layout(request, outline, story, ["/static/panels/test.png"])
+    assert len(layout) == 1
+    assert layout[0].title == "The Door"
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+jinja2>=3.1,<4.0
+python-multipart>=0.0.9,<1.0
+pydantic>=2.8,<3.0
+pydantic-settings>=2.4,<3.0
+google-genai>=1.0,<2.0
+huggingface-hub>=0.30,<1.0
+Pillow>=10.0,<12.0
+fpdf2>=2.8,<3.0
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0
+
+================================================================================
+FILE: requirements-local-diffusers.txt
+================================================================================
+-r requirements.txt
+torch>=2.2
+diffusers>=0.30
+transformers>=4.45
+accelerate>=0.34
+safetensors>=0.4
+
+================================================================================
+FILE: .env.example
+================================================================================
+GEMINI_API_KEY=your_gemini_api_key_here
+HF_API_KEY=your_huggingface_token_here
+GEMINI_FLASH_MODEL=gemini-2.5-flash
+GEMINI_PRO_MODEL=gemini-2.5-pro
+IMAGE_BACKEND=hf
+HF_IMAGE_MODEL=stabilityai/stable-diffusion-3.5-large-turbo
+PANEL_COUNT=5
+MAX_PANELS=8
+IMAGE_WIDTH=768
+IMAGE_HEIGHT=768
+APP_NAME=ComicCraft
+DEBUG=true
+
+================================================================================
+FILE: .gitignore
+================================================================================
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.vscode/
+static/panels/*.png
+static/exports/*.pdf
+
+================================================================================
+FILE: run.py
+================================================================================
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
+
+================================================================================
+FILE: README.md
+================================================================================
+# ComicCraft — AI Comic Story Creator
+
+ComicCraft is a FastAPI web application that turns a user's story idea into a multi-panel comic. The workflow is: Gemini Flash outline → Gemini Pro story → text-to-image illustration → layout → PDF export → Jinja2 preview.
+
+## 1. Open in VS Code
+Open the `ComicCraft` folder in VS Code.
+
+## 2. Create virtual environment
+Windows PowerShell:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+Windows CMD:
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+```
+macOS/Linux:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+## 3. Install
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## 4. Configure keys
+Copy `.env.example` to `.env` and add your Gemini API key and Hugging Face token.
+
+## 5. Run
+```bash
+python run.py
+```
+Or:
+```bash
+uvicorn app.main:app --reload
+```
+Open http://127.0.0.1:8000
+
+Swagger: http://127.0.0.1:8000/docs
+Health: http://127.0.0.1:8000/health
+
+## 6. Test
+```bash
+pytest -q
+```
+
+## API
+- GET `/`
+- POST `/generate`
+- POST `/generate-comic/json`
+- POST `/test-image`
+- GET `/export-success`
+- GET `/health`
+
+## Image backend
+Default is Hugging Face (`IMAGE_BACKEND=hf`). Optional local Diffusers support is available with `requirements-local-diffusers.txt`; a suitable GPU is recommended.
+
+## Important
+The project documentation describes Gemini Flash/Pro and Stable Diffusion. Model IDs can change, so they are configurable through `.env` rather than hard-coded everywhere.
+
